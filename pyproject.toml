@@ -1,6 +1,6 @@
 [project]
 name = "music-mood-search"
-version = "0.1.1"
+version = "0.1.0"
 description = "Asynchronous MLOps web service"
 readme = "README.md"
 authors = [
