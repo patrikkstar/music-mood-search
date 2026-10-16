@@ -1,0 +1,5 @@
+essentia-tensorflow
+numpy
+pandas
+pyarrow
+requests

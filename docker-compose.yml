@@ -1,4 +1,10 @@
-﻿services:
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
   app:
     build:
       context: .
@@ -8,10 +14,17 @@
       ENVIRONMENT: production
       LOG_LEVEL: INFO
       DATABASE_URL: postgresql://postgres:postgres@db:5432/postgres
+      # Модель берётся из Model Registry по alias. Чтобы сменить версию,
+      # переназначьте alias и перезапустите app (код не меняется).
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: music-tagger
+      MODEL_ALIAS: champion
     ports:
       - "8000:8000"
     depends_on:
       db:
+        condition: service_healthy
+      mlflow:
         condition: service_healthy
     networks:
       - app_network
@@ -26,14 +39,11 @@
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 1g
     cpus: 1.0
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   db:
     image: postgres:17-alpine
@@ -55,14 +65,127 @@
     restart: unless-stopped
     mem_limit: 512m
     cpus: 1.0
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------- MLflow
+
+  # Backend Store: метаданные MLflow (эксперименты, runs, параметры,
+  # метрики, датасеты, Model Registry). Отдельный PostgreSQL, чтобы не
+  # смешивать данные приложения и данные MLflow.
+  mlflow-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD:-mlflow}
+      POSTGRES_DB: mlflow
+    volumes:
+      - mlflow_db_data:/var/lib/postgresql/data
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *default-logging
+
+  # Artifact Store: файлы (модели, графики, CSV) в S3-совместимом MinIO.
+  # Образы minio/minio убраны с Docker Hub и quay.io, поэтому берём сборку
+  # Bitnami из архива bitnamilegacy (внутри тот же MinIO).
+  # Бакеты создаёт aws-cli (сервис minio-init).
+  minio:
+    image: bitnamilegacy/minio:latest
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # веб-консоль
+    volumes:
+      - minio_data:/bitnami/minio/data
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *default-logging
+
+  # Одноразовый контейнер: создаёт бакеты и завершается.
+  minio-init:
+    image: amazon/aws-cli:2.17.0
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      aws --endpoint-url http://minio:9000 s3 mb s3://mlflow || true;
+      aws --endpoint-url http://minio:9000 s3 mb s3://datasets || true;
+      aws --endpoint-url http://minio:9000 s3 ls
+      "
+    networks:
+      - app_network
+    restart: "no"
+
+  # Tracking Server + Model Registry + UI (http://localhost:5000).
+  # --serve-artifacts: клиенты отправляют артефакты через сервер,
+  # поэтому приложению не нужны ключи от MinIO.
+  mlflow:
+    build:
+      context: docker/mlflow
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --workers 2
+      --backend-store-uri postgresql://mlflow:${MLFLOW_DB_PASSWORD:-mlflow}@mlflow-db:5432/mlflow
+      --artifacts-destination s3://mlflow
+      --serve-artifacts
+      --allowed-hosts localhost,localhost:*,127.0.0.1,127.0.0.1:*,mlflow,mlflow:*
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "5000:5000"
+    depends_on:
+      mlflow-db:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - app_network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    mem_limit: 2g
+    logging: *default-logging
 
 volumes:
   postgres_data:
+  mlflow_db_data:
+  minio_data:
 
 networks:
   app_network:

@@ -19,6 +19,12 @@ class JsonFormatter(logging.Formatter):
             "path",
             "status_code",
             "duration_ms",
+            "model_uri",
+            "model_version",
+            "run_id",
+            "attempt",
+            "batch_size",
+            "error",
         )
 
         for field in extra_fields:

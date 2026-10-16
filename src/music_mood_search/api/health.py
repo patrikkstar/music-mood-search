@@ -8,7 +8,10 @@ from music_mood_search.schemas import (
     HealthResponse,
     VersionResponse,
 )
-from music_mood_search.services.health import check_database_health
+from music_mood_search.services.health import (
+    check_database_health,
+    check_model_health,
+)
 
 router = APIRouter()
 
@@ -31,10 +34,13 @@ async def health(
     database_health = await check_database_health(request.app.state.db_pool)
 
     database = ComponentHealth(**database_health)
+    model = ComponentHealth(
+        **check_model_health(getattr(request.app.state, "model_service", None))
+    )
 
     overall_status = "ok"
 
-    if database.status != "ok":
+    if database.status != "ok" or model.status != "ok":
         overall_status = "error"
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
@@ -42,5 +48,6 @@ async def health(
         status=overall_status,
         components={
             "database": database,
+            "model": model,
         },
     )

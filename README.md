@@ -19,6 +19,33 @@
 - публикация образов в GitHub Container Registry;
 - структурированное JSON-логирование.
 
+## ДЗ3: MLflow
+
+Добавлен полный ML-цикл для классификатора тегов (genre / instrument / mood)
+поверх эмбеддингов EffNet-Discogs:
+
+- MLflow Tracking Server в Docker Compose: Backend Store в PostgreSQL
+  (`mlflow-db`), Artifact Store в MinIO (S3);
+- EDA, Dataset Tracking, эксперименты и Model Registry (`training/`);
+- модель загружается из Registry по alias `champion` при старте приложения;
+- `POST /api/v1/process` и `GET /api/v1/model`.
+
+Быстрый старт:
+
+```bash
+cp .env.example .env
+uv lock && uv sync --group training
+docker compose up --build -d
+uv run --env-file .env --group training python training/upload_dataset.py \
+    --file training/data/out/embeddings.parquet \
+    --manifest training/data/out/manifest.json
+uv run --env-file .env --group training python training/eda.py
+uv run --env-file .env --group training python training/train.py --model all
+uv run --env-file .env --group training python training/registry.py promote
+docker compose restart app
+uv run --env-file .env --group training python training/demo_request.py
+```
+
 ## Структура проекта
 
 ```text
@@ -28,15 +55,21 @@ music-mood-search/
 │       ├── ci.yml
 │       └── cd.yml
 │
+├── docker/
+│   └── mlflow/
+│       └── Dockerfile          # образ MLflow Tracking Server
+│
 ├── src/
 │   └── music_mood_search/
 │       ├── api/
 │       │   ├── __init__.py
-│       │   └── health.py
+│       │   ├── health.py
+│       │   └── process.py      # POST /api/v1/process, GET /api/v1/model
 │       │
 │       ├── services/
 │       │   ├── __init__.py
-│       │   └── health.py
+│       │   ├── health.py
+│       │   └── model.py        # загрузка модели из Model Registry
 │       │
 │       ├── __init__.py
 │       ├── app.py
@@ -45,10 +78,25 @@ music-mood-search/
 │       ├── logging_config.py
 │       └── schemas.py
 │
+├── training/
+│   ├── data/
+│   │   ├── extract_embeddings.py   # эмбеддинги EffNet-Discogs из аудио
+│   │   └── requirements.txt
+│   ├── common.py                   # датасет, Dataset Tracking, метки
+│   ├── demo_request.py             # демонстрационный запрос к /process
+│   ├── eda.py                      # EDA, артефакты в MLflow
+│   ├── music_tagger_pyfunc.py      # pyfunc-обёртка модели
+│   ├── registry.py                 # версии, alias champion
+│   ├── train.py                    # Runs, метрики, регистрация моделей
+│   └── upload_dataset.py           # загрузка датасета в MinIO
+│
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py
-│   └── test_health.py
+│   ├── fakes.py
+│   ├── test_health.py
+│   ├── test_model_service.py
+│   └── test_process.py
 │
 ├── .dockerignore
 ├── .env.example
@@ -70,6 +118,12 @@ music-mood-search/
 - PostgreSQL 17
 - asyncpg
 - Pydantic Settings
+- MLflow
+- MinIO
+- scikit-learn
+- NumPy
+- pandas
+- Essentia
 - uv
 - pytest
 - pytest-asyncio
@@ -84,7 +138,7 @@ music-mood-search/
 
 ## API
 
-В приложении реализованы три основных эндпоинта.
+В приложении реализованы пять эндпоинтов.
 
 ### `GET /healthz`
 
@@ -104,16 +158,40 @@ music-mood-search/
 
 Выполняет end-to-end health-check сторонних компонентов приложения.
 
-На текущем этапе проверяется PostgreSQL.
+На текущем этапе проверяются PostgreSQL и модель из MLflow Model Registry.
 
 Эндпоинт возвращает:
 
-- состояние компонента;
-- версию PostgreSQL;
+- общий статус;
+- состояние каждого компонента (`database`, `model`);
+- версию компонента (для модели: имя, версия и alias);
 - время ответа;
 - информацию об ошибке при недоступности компонента.
 
-Если PostgreSQL недоступен, endpoint возвращает HTTP-код `503 Service Unavailable`.
+Если PostgreSQL недоступен или модель не загружена, endpoint возвращает HTTP-код `503 Service Unavailable`.
+
+### `GET /api/v1/model`
+
+Показывает, какая модель обслуживает запросы: имя, alias, версию, `run_id` в MLflow и URI загруженной версии.
+
+Если модель не загружена, возвращает `503 Service Unavailable`.
+
+### `POST /api/v1/process`
+
+Принимает до 64 эмбеддингов EffNet-Discogs (по 1280 чисел в каждом) и возвращает для каждого трека теги трёх категорий: `genre`, `instrument` и `mood`. У каждого тега есть оценка (`score`).
+
+Пример запроса:
+
+```json
+{ "embeddings": [[0.01, 0.02, "... 1280 чисел ..."]] }
+```
+
+В ответе:
+
+- `model` с информацией о версии модели, которая дала предсказание;
+- `predictions` со списками тегов для каждого трека;
+- `inference_ms`, время работы модели.
+
 
 ## Конфигурация
 
@@ -125,7 +203,16 @@ music-mood-search/
 
 ```text
 postgresql://postgres:postgres@db:5432/postgres
+http://mlflow:5000
 ```
+
+Настройки модели:
+
+| Переменная | Назначение | По умолчанию |
+|---|---|---|
+| `MLFLOW_TRACKING_URI` | адрес MLflow Tracking Server | `http://mlflow:5000` внутри Compose |
+| `MODEL_NAME` | имя модели в Model Registry | `music-tagger` |
+| `MODEL_ALIAS` | alias версии, которая обслуживает запросы | `champion` |
 
 
 
@@ -178,7 +265,10 @@ uv run pytest --cov=music_mood_search --cov-report=term-missing
 - успешный `/healthz`;
 - успешный `/api/v1/version`;
 - успешный `/api/v1/health`;
-- ситуация, когда PostgreSQL недоступен.
+- ситуации, когда PostgreSQL недоступен или модель не загружена;
+- загрузка модели: alias превращается в конкретную версию, повторные попытки при ошибке;
+- `POST /api/v1/process`: успешный запрос, неверная размерность эмбеддинга, слишком большой пакет, ответ `503` без модели;
+- `GET /api/v1/model`.
 
 Минимально допустимое покрытие:
 
@@ -248,9 +338,7 @@ Dockerfile использует:
 
 ## Docker Compose
 
-Для запуска всего приложения используется Docker Compose.
-
-Запустить приложение и PostgreSQL:
+Запустить приложение, PostgreSQL и MLflow с хранилищем:
 
 ```bash
 docker compose up --build -d
@@ -262,31 +350,41 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Оба сервиса должны иметь статус `healthy`:
+Все основные сервисы должны иметь статус `healthy`:
 
 ```text
-app    healthy
-db     healthy
+app          healthy
+db           healthy
+mlflow       healthy
+mlflow-db    healthy
+minio        healthy
 ```
 
+Сервис `minio-init` разовый: он создаёт бакеты `mlflow` и `datasets` и завершается со статусом `Exited (0)`.
 
-Для подключения к PostgreSQL с хостовой Windows-машины используется:
+Адреса с хостовой машины:
 
 ```text
-localhost:55432
+API:           http://localhost:8000
+MLflow UI:     http://localhost:5000
+MinIO консоль: http://localhost:9001
+PostgreSQL:    localhost:55432
 ```
 
 Docker Compose содержит:
 
 - сервис приложения;
-- сервис PostgreSQL;
+- PostgreSQL приложения;
+- MLflow Tracking Server и Model Registry;
+- отдельный PostgreSQL для Backend Store MLflow;
+- MinIO (S3) как Artifact Store;
 - отдельную Docker network;
-- persistent volume для PostgreSQL;
-- healthcheck приложения;
-- healthcheck базы данных;
-- ограничения памяти и CPU;
+- persistent volumes для обеих баз и для MinIO;
+- healthcheck каждого сервиса;
+- ограничения памяти;
 - ротацию логов;
 - restart policy.
+
 
 Просмотр логов приложения:
 
@@ -320,7 +418,9 @@ docker compose down
 - HTTP status code;
 - время выполнения запроса;
 - завершение приложения;
-- закрытие connection pool.
+- закрытие connection pool;
+- загрузка модели из MLflow (URI, версия, `run_id`, номер попытки);
+- каждый вызов inference (версия модели, размер пакета, время).
 
 ## CI
 
@@ -468,5 +568,3 @@ v0.1.1 — добавлено структурированное логиров�
 6. Индексация треков в Chroma.
 7. Поиск треков по текстовому описанию пользователя.
 8. Возможность загрузки собственного трека и добавления его в поисковую коллекцию.
-
-ML-часть будет отделена от web-serving слоя, чтобы тяжёлые зависимости для обучения моделей не устанавливались в production-контейнер API.
