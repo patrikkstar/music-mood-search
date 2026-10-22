@@ -4,11 +4,14 @@ from contextlib import asynccontextmanager
 from time import perf_counter
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 
 from music_mood_search.api.health import router as health_router
+from music_mood_search.api.process import router as process_router
 from music_mood_search.config import get_settings
 from music_mood_search.db import close_db_pool, create_db_pool
 from music_mood_search.logging_config import configure_logging
+from music_mood_search.services.model import ModelService, load_model_on_startup
 
 logger = logging.getLogger("music_mood_search.app")
 
@@ -29,6 +32,13 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             "component": "postgres",
         },
     )
+
+    # Модель загружается из MLflow один раз при старте.
+    # /process дальше использует уже загруженный объект.
+    settings = get_settings()
+    model_service = ModelService(settings)
+    await run_in_threadpool(load_model_on_startup, model_service, settings)
+    application.state.model_service = model_service
 
     try:
         yield
@@ -75,6 +85,7 @@ def create_app() -> FastAPI:
         return response
 
     application.include_router(health_router)
+    application.include_router(process_router)
 
     return application
 

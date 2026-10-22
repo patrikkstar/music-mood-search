@@ -27,3 +27,21 @@ async def check_database_health(pool: asyncpg.Pool) -> dict[str, str | float]:
             "response_time_ms": round(response_time_ms, 2),
             "error": str(exc),
         }
+
+
+def check_model_health(service) -> dict[str, str | float]:
+    """Состояние модели: загружена ли и какая версия используется."""
+    if service is None or not service.is_loaded:
+        return {
+            "status": "error",
+            "version": "unknown",
+            "response_time_ms": 0.0,
+            "error": getattr(service, "last_error", None) or "Model is not loaded",
+        }
+
+    info = service.info
+    return {
+        "status": "ok",
+        "version": f"{info.name} v{info.version} (@{info.alias})",
+        "response_time_ms": 0.0,
+    }

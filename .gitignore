@@ -6,3 +6,15 @@ __pycache__/
 .coverage
 htmlcov/
 .idea/
+
+# ML / данные
+.cache/
+mlruns/
+mlartifacts/
+training/data/.venv/
+training/data/out/
+training/data/models/
+*.parquet
+*.tar
+*.log
+mlflow.db

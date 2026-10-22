@@ -1,6 +1,7 @@
 from importlib.metadata import version
 
 from music_mood_search.app import app
+from tests.fakes import FakeModelService
 
 
 async def test_healthz(client):
@@ -35,6 +36,7 @@ async def test_health_success(client, monkeypatch):
     )
 
     app.state.db_pool = object()
+    app.state.model_service = FakeModelService()
 
     response = await client.get("/api/v1/health")
 
@@ -46,6 +48,8 @@ async def test_health_success(client, monkeypatch):
     assert data["components"]["database"]["status"] == "ok"
     assert data["components"]["database"]["version"] == "PostgreSQL 17.11"
     assert data["components"]["database"]["response_time_ms"] == 1.23
+    assert data["components"]["model"]["status"] == "ok"
+    assert data["components"]["model"]["version"] == "music-tagger v3 (@champion)"
 
 
 async def test_health_database_error(client, monkeypatch):
@@ -63,6 +67,7 @@ async def test_health_database_error(client, monkeypatch):
     )
 
     app.state.db_pool = object()
+    app.state.model_service = FakeModelService()
 
     response = await client.get("/api/v1/health")
 
@@ -73,3 +78,31 @@ async def test_health_database_error(client, monkeypatch):
     assert data["status"] == "error"
     assert data["components"]["database"]["status"] == "error"
     assert data["components"]["database"]["error"] == "Database unavailable"
+
+
+async def test_health_model_not_loaded(client, monkeypatch):
+    async def fake_check_database_health(pool):
+        return {
+            "status": "ok",
+            "version": "PostgreSQL 17.11",
+            "response_time_ms": 1.0,
+        }
+
+    monkeypatch.setattr(
+        "music_mood_search.api.health.check_database_health",
+        fake_check_database_health,
+    )
+
+    app.state.db_pool = object()
+    app.state.model_service = FakeModelService(loaded=False)
+
+    response = await client.get("/api/v1/health")
+
+    assert response.status_code == 503
+
+    data = response.json()
+
+    assert data["status"] == "error"
+    assert data["components"]["database"]["status"] == "ok"
+    assert data["components"]["model"]["status"] == "error"
+    assert data["components"]["model"]["error"] == "registry unavailable"
