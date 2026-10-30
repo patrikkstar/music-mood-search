@@ -84,6 +84,16 @@ def test_predict_converts_to_float32(settings, fake_mlflow):
     assert batch.shape == (1, 1280)
 
 
+def test_predict_uses_ready_float32_array_without_copy(settings, fake_mlflow):
+    service = ModelService(settings)
+    service.load()
+    batch = np.zeros((2, 1280), dtype=np.float32)
+
+    service.predict(batch)
+
+    assert fake_mlflow.pyfunc.inputs[0] is batch
+
+
 def test_predict_without_model_raises(settings):
     service = ModelService(settings)
 
@@ -130,3 +140,21 @@ def test_model_health_without_service():
 
     assert health["status"] == "error"
     assert health["error"] == "Model is not loaded"
+
+
+def test_load_reads_embedding_contract_from_metadata(settings, fake_mlflow):
+    contract = {"model": "discogs-effnet-bs64-1", "dim": 1280}
+    fake_mlflow.pyfunc.metadata = SimpleNamespace(metadata={"embedding": contract})
+    service = ModelService(settings)
+
+    info = service.load()
+
+    assert info.embedding == contract
+
+
+def test_load_without_metadata_has_no_embedding_contract(settings, fake_mlflow):
+    service = ModelService(settings)
+
+    info = service.load()
+
+    assert info.embedding is None

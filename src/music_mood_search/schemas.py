@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -38,6 +40,9 @@ class TrackPrediction(BaseModel):
     genre: list[TagScore]
     instrument: list[TagScore]
     mood: list[TagScore]
+    # Темы (назначение музыки: cinematic, party, ...). У старых версий модели
+    # тем нет, тогда список пустой.
+    theme: list[TagScore] = []
 
 
 class ModelInfoResponse(BaseModel):
@@ -46,6 +51,9 @@ class ModelInfoResponse(BaseModel):
     version: str
     run_id: str | None
     uri: str
+    # Как должен быть получен эмбеддинг (модель, слой, частота, пулинг).
+    # None у старых версий модели, где эти данные не сохранялись.
+    embedding: dict[str, Any] | None = None
 
 
 class ProcessResponse(BaseModel):

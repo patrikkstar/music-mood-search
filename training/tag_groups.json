@@ -1,0 +1,29 @@
+{
+  "description": "Группировка тегов MTG-Jamendo mood/theme, версия 2: черновик, уточнённый по похожести тегов (training/tag_similarity.py, датасет v2). Теги из раздела theme образуют отдельную категорию, остальные считаются настроениями. Трек относится к группе, если у него есть хотя бы один тег группы. Теги, которых нет ни в одной группе (melodic), не используются.",
+  "mood": {
+    "epic": ["epic", "dramatic"],
+    "energetic": ["energetic", "powerful", "heavy", "fast"],
+    "happy": ["happy", "positive", "uplifting", "upbeat", "fun", "funny"],
+    "inspiring": ["inspiring", "motivational"],
+    "calm": ["calm", "relaxing", "meditative", "soft", "hopeful"],
+    "sentimental": ["sad", "melancholic", "emotional", "romantic"],
+    "love": ["love", "ballad", "sexy"],
+    "ambient": ["dream", "soundscape", "space"],
+    "dark": ["dark", "slow"],
+    "groovy": ["groovy", "cool"],
+    "melodic": ["melodic"]
+  },
+  "theme": {
+    "cinematic": ["film", "movie", "trailer", "drama", "action", "adventure"],
+    "game": ["game"],
+    "commercial": ["corporate", "commercial", "advertising"],
+    "background": ["background"],
+    "holiday": ["christmas", "holiday"],
+    "children": ["children"],
+    "nature": ["nature", "documentary"],
+    "party": ["party", "summer", "deep"],
+    "sport": ["sport"],
+    "retro": ["retro"],
+    "travel": ["travel"]
+  }
+}

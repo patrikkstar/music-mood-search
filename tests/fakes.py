@@ -1,9 +1,12 @@
 from music_mood_search.services.model import ModelInfo, ModelNotLoadedError
 
+EMBEDDING_CONTRACT = {"model": "discogs-effnet-bs64-1", "dim": 1280}
+
 PREDICTION = {
     "genre": [{"tag": "rock", "score": 0.91}],
     "instrument": [{"tag": "guitar", "score": 0.77}],
     "mood": [{"tag": "energetic", "score": 0.66}, {"tag": "happy", "score": 0.51}],
+    "theme": [{"tag": "cinematic", "score": 0.58}],
 }
 
 
@@ -13,7 +16,7 @@ class FakeModelService:
     def __init__(self, loaded: bool = True) -> None:
         self._loaded = loaded
         self.last_error = None if loaded else "registry unavailable"
-        self.calls: list[list[list[float]]] = []
+        self.calls: list = []
 
     @property
     def is_loaded(self) -> bool:
@@ -30,8 +33,9 @@ class FakeModelService:
             run_id="run-123",
             uri="models:/music-tagger/3",
             loaded_at=0.0,
+            embedding=EMBEDDING_CONTRACT,
         )
 
-    def predict(self, embeddings: list[list[float]]) -> list[dict]:
+    def predict(self, embeddings) -> list[dict]:
         self.calls.append(embeddings)
         return [PREDICTION for _ in embeddings]

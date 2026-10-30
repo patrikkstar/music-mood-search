@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,15 +33,25 @@ META_COLUMNS = [
     "instrument",
     "mood",
 ]
-LABEL_SEP = "---"
 DATASET_NAME = "mtg-jamendo-moodtheme-effnet"
+
+# Как получен эмбеддинг (см. training/data/extract_embeddings.py). Сохраняется
+# в метаданных модели: сервис корректно работает только с такими векторами.
+EMBEDDING_CONTRACT = {
+    "model": "discogs-effnet-bs64-1",
+    "output": "PartitionedCall:1",
+    "sample_rate": 16000,
+    "channels": "mono",
+    "pooling": "mean over patches of the full track",
+    "dim": EMBEDDING_DIM,
+}
 
 
 @dataclass(frozen=True)
 class Config:
     tracking_uri: str
     s3_endpoint_url: str
-    dataset_uri: str
+    dataset_uri: str | None
     experiment: str
     eda_experiment: str
     registered_model: str
@@ -52,10 +64,9 @@ class Config:
             s3_endpoint_url=os.getenv(
                 "MLFLOW_S3_ENDPOINT_URL", "http://localhost:9000"
             ),
-            dataset_uri=os.getenv(
-                "DATASET_URI",
-                "s3://datasets/mtg-jamendo-moodtheme/v1/embeddings.parquet",
-            ),
+            # Версия данных выбирается явно: без DATASET_URI (или --data)
+            # скрипты остановятся, а не возьмут молча устаревший датасет.
+            dataset_uri=os.getenv("DATASET_URI") or None,
             experiment=os.getenv("MLFLOW_EXPERIMENT", "music-tagger"),
             eda_experiment=os.getenv("MLFLOW_EDA_EXPERIMENT", "music-tagger-eda"),
             registered_model=os.getenv("MODEL_NAME", "music-tagger"),
@@ -166,31 +177,66 @@ def tag_counts(df: pd.DataFrame, category: str) -> pd.Series:
     return exploded.value_counts()
 
 
-def select_labels(
-    train_df: pd.DataFrame,
-    min_count: int,
-    max_per_category: int | None = None,
-) -> list[str]:
-    """Теги, у которых в train не меньше min_count положительных примеров."""
-    labels: list[str] = []
-    for category in CATEGORIES:
-        counts = tag_counts(train_df, category)
-        counts = counts[counts >= min_count]
-        if max_per_category:
-            counts = counts.head(max_per_category)
-        labels += [f"{category}{LABEL_SEP}{tag}" for tag in sorted(counts.index)]
-    return labels
+# Целевые категории модели. mood и theme строятся из колонки "mood"
+# (в MTG-Jamendo настроения и темы лежат вместе) по группам из tag_groups.json.
+TARGETS = ("genre", "instrument", "mood", "theme")
+DEFAULT_GROUPS_FILE = Path(__file__).with_name("tag_groups.json")
 
 
-def label_matrix(df: pd.DataFrame, labels: list[str]) -> np.ndarray:
-    index = {label: i for i, label in enumerate(labels)}
-    y = np.zeros((len(df), len(labels)), dtype=np.int8)
-    for row, rec in enumerate(df[list(CATEGORIES)].itertuples(index=False)):
-        for category, value in zip(CATEGORIES, rec, strict=True):
-            for tag in split_tags(value):
-                j = index.get(f"{category}{LABEL_SEP}{tag}")
-                if j is not None:
-                    y[row, j] = 1
+def load_tag_groups(path: Path) -> dict[str, dict[str, list[str]]]:
+    """{"mood": {группа: [теги]}, "theme": {группа: [теги]}} с проверкой повторов."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    groups = {kind: dict(data.get(kind, {})) for kind in ("mood", "theme")}
+    seen: dict[str, str] = {}
+    for kind_groups in groups.values():
+        for group, tags in kind_groups.items():
+            for tag in tags:
+                if tag in seen:
+                    raise ValueError(f"Тег {tag} есть в группах {seen[tag]} и {group}")
+                seen[tag] = group
+    return groups
+
+
+def file_digest(path: Path, length: int = 12) -> str:
+    return file_sha256(path)[:length]
+
+
+def targets_for(groups: dict | None) -> tuple[str, ...]:
+    """С группами модель предсказывает 4 категории, без них 3 (теги как есть)."""
+    return TARGETS if groups else CATEGORIES
+
+
+def target_labels(
+    df: pd.DataFrame, target: str, groups: dict | None = None
+) -> pd.Series:
+    """Метки каждого трека для целевой категории (список строк).
+
+    genre, instrument: теги как есть. mood, theme при заданных группах: названия
+    групп, в которые попадают теги трека из колонки "mood"; без групп mood
+    это исходные теги mood/theme.
+    """
+    if target in ("genre", "instrument") or (target == "mood" and not groups):
+        return df[target].map(split_tags)
+    if not groups:
+        raise ValueError(f"Категория {target} требует файла групп")
+    mapping = {tag: g for g, tags in groups[target].items() for tag in tags}
+    return df["mood"].map(
+        lambda v: sorted({mapping[t] for t in split_tags(v) if t in mapping})
+    )
+
+
+def label_counts(labels: pd.Series) -> pd.Series:
+    return labels.explode().dropna().value_counts()
+
+
+def label_matrix(labels: pd.Series, names: list[str]) -> np.ndarray:
+    index = {name: i for i, name in enumerate(names)}
+    y = np.zeros((len(labels), len(names)), dtype=np.int8)
+    for row, values in enumerate(labels):
+        for value in values:
+            j = index.get(value)
+            if j is not None:
+                y[row, j] = 1
     return y
 
 
@@ -198,9 +244,29 @@ def features(df: pd.DataFrame) -> np.ndarray:
     return df[EMBEDDING_COLUMNS].to_numpy(dtype=np.float32)
 
 
-def label_category(label: str) -> str:
-    return label.split(LABEL_SEP, 1)[0]
+DATA_VERSION_RE = re.compile(r"v\d+")
 
 
-def label_tag(label: str) -> str:
-    return label.split(LABEL_SEP, 1)[1]
+def data_version(uri: str, file_sha: str | None = None) -> str:
+    """Версия датасета по соглашению о путях: .../vN/embeddings.parquet -> vN.
+
+    Если путь не следует соглашению (например, локальный файл
+    training/data/out/embeddings.parquet), версия = "sha-" и первые символы
+    sha256 файла. Настоящий идентификатор данных всё равно sha256: версия
+    нужна только как понятная подпись в MLflow и Model Registry.
+    """
+    folder = Path(urlparse(uri).path if "://" in uri else uri).parent.name
+    if DATA_VERSION_RE.fullmatch(folder):
+        return folder
+    return f"sha-{file_sha[:8]}" if file_sha else "unknown"
+
+
+def require_dataset_uri(uri: str | None) -> str:
+    """Датасет должен быть указан явно: --data или DATASET_URI в .env."""
+    if not uri:
+        raise SystemExit(
+            "Не указан датасет: передайте --data "
+            "s3://datasets/mtg-jamendo-moodtheme/vN/embeddings.parquet "
+            "или задайте DATASET_URI в .env"
+        )
+    return uri

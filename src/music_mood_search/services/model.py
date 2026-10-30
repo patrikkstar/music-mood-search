@@ -33,6 +33,7 @@ class ModelInfo:
     run_id: str | None
     uri: str
     loaded_at: float
+    embedding: dict[str, Any] | None = None
 
 
 class ModelService:
@@ -72,15 +73,28 @@ class ModelService:
             run_id=model_version.run_id,
             uri=version_uri,
             loaded_at=time.time(),
+            embedding=_embedding_contract(model),
         )
         self.last_error = None
         return self._info
 
-    def predict(self, embeddings: list[list[float]]) -> list[dict[str, Any]]:
+    def predict(
+        self, embeddings: np.ndarray | list[list[float]]
+    ) -> list[dict[str, Any]]:
         if self._model is None:
             raise ModelNotLoadedError("Model is not loaded")
+        # Готовый массив float32 (его передаёт /process) используется как есть,
+        # без копирования; список чисел превращается в массив.
         batch = np.asarray(embeddings, dtype=np.float32)
         return list(self._model.predict(batch))
+
+
+def _embedding_contract(model: Any) -> dict[str, Any] | None:
+    """Описание эмбеддинга из метаданных pyfunc-модели (если оно сохранено)."""
+    metadata = getattr(getattr(model, "metadata", None), "metadata", None)
+    if isinstance(metadata, dict) and isinstance(metadata.get("embedding"), dict):
+        return metadata["embedding"]
+    return None
 
 
 def load_model_on_startup(

@@ -1,6 +1,7 @@
 import logging
 from time import perf_counter
 
+import numpy as np
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 
@@ -35,6 +36,7 @@ def _model_info(service: ModelService) -> ModelInfoResponse:
         version=info.version,
         run_id=info.run_id,
         uri=info.uri,
+        embedding=info.embedding,
     )
 
 
@@ -67,10 +69,25 @@ async def process(payload: ProcessRequest, request: Request) -> ProcessResponse:
             ),
         )
 
+    # NaN, Infinity и значения вне диапазона float32 модель обработать не может.
+    # Проверяем здесь, а не в схеме: ошибка валидации pydantic вернула бы
+    # исходное значение NaN в теле ответа, а его нельзя сериализовать в JSON.
+    with np.errstate(over="ignore"):
+        batch = np.asarray(payload.embeddings, dtype=np.float32)
+    not_finite = np.flatnonzero(~np.isfinite(batch).all(axis=1)).tolist()
+    if not_finite:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "Embeddings must contain only finite float32 values, "
+                f"wrong items: {not_finite[:10]}"
+            ),
+        )
+
     started_at = perf_counter()
     # Inference CPU-bound, поэтому выполняется в пуле потоков
     # и не блокирует event loop.
-    raw = await run_in_threadpool(service.predict, payload.embeddings)
+    raw = await run_in_threadpool(service.predict, batch)
     inference_ms = round((perf_counter() - started_at) * 1000, 2)
 
     info = _model_info(service)

@@ -18,9 +18,11 @@ import pandas as pd
 from common import (
     CATEGORIES,
     Config,
+    data_version,
     features,
     load_dataset,
     log_dataset_inputs,
+    require_dataset_uri,
     split_tags,
     tag_counts,
 )
@@ -172,6 +174,7 @@ def main() -> None:
 
     mlflow.set_tracking_uri(cfg.tracking_uri)
     mlflow.set_experiment(cfg.eda_experiment)
+    args.data = require_dataset_uri(args.data)
     df, file_sha = load_dataset(args.data, cfg, refresh=args.refresh_data)
 
     artists = {s: set(df.loc[df["split"] == s, "artist_id"]) for s in SPLITS}
@@ -198,7 +201,13 @@ def main() -> None:
     with mlflow.start_run(run_name="eda"), tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         mlflow.set_tags({"stage": "eda"})
-        mlflow.log_params({"data.uri": args.data, "data.file_sha256": file_sha})
+        mlflow.log_params(
+            {
+                "data.uri": args.data,
+                "data.version": data_version(args.data, file_sha),
+                "data.file_sha256": file_sha,
+            }
+        )
         log_dataset_inputs(df, source=args.data, splits=SPLITS)
 
         plot_top_tags(df, tmp_dir / "01_top_tags.png")
