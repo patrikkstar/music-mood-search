@@ -11,6 +11,7 @@ htmlcov/
 .cache/
 mlruns/
 mlartifacts/
+reports/model-v6/diagnostics/
 training/data/.venv/
 training/data/out/
 training/data/models/

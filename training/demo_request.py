@@ -13,7 +13,15 @@ import argparse
 import json
 import urllib.request
 
-from common import CATEGORIES, EMBEDDING_COLUMNS, Config, load_dataset
+from common import (
+    DEFAULT_GROUPS_FILE,
+    EMBEDDING_COLUMNS,
+    Config,
+    load_dataset,
+    load_tag_groups,
+    require_dataset_uri,
+    target_labels,
+)
 
 
 def main() -> None:
@@ -25,7 +33,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    df, _ = load_dataset(args.data, cfg)
+    df, _ = load_dataset(require_dataset_uri(args.data), cfg)
     sample = df[df["split"] == "test"].sample(args.n, random_state=args.seed)
     payload = {"embeddings": sample[EMBEDDING_COLUMNS].to_numpy().tolist()}
 
@@ -41,12 +49,24 @@ def main() -> None:
     model = result["model"]
     print(f"Модель: {model['name']} v{model['version']} (@{model['alias']})")
     print(f"Inference: {result['inference_ms']} ms\n")
-    for (_, row), pred in zip(sample.iterrows(), result["predictions"], strict=True):
-        print(row["track_id"])
-        for category in CATEGORIES:
-            predicted = ", ".join(t["tag"] for t in pred[category])
+    # Настоящие метки: жанры и инструменты как есть, mood и theme по группам.
+    groups = (
+        load_tag_groups(DEFAULT_GROUPS_FILE) if DEFAULT_GROUPS_FILE.exists() else None
+    )
+    true = {
+        c: target_labels(sample, c, groups)
+        for c in ("genre", "instrument", "mood", "theme")
+        if c in ("genre", "instrument", "mood") or groups
+    }
+    for i, ((_, row), pred) in enumerate(
+        zip(sample.iterrows(), result["predictions"], strict=True)
+    ):
+        print(f"{row['track_id']}  (исходные теги mood/theme: {row['mood'] or '-'})")
+        for category, tags in pred.items():
+            predicted = ", ".join(t["tag"] for t in tags) or "-"
+            expected = ", ".join(true[category].iloc[i]) if category in true else "?"
             print(f"  {category:<10} pred: {predicted}")
-            print(f"  {'':<10} true: {row[category].replace('|', ', ') or '-'}")
+            print(f"  {'':<10} true: {expected or '-'}")
         print()
 
 

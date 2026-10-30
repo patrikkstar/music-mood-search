@@ -2,7 +2,7 @@
 
 Асинхронный веб-сервис на FastAPI, разработанный в рамках курса MLOps.
 
-В дальнейшем проект будет использоваться как основа для сервиса **Music Mood Search** — системы поиска музыкальных треков по текстовому описанию настроения, жанра и инструментов.
+В дальнейшем проект будет использоваться как основа для сервиса **Music Mood Search**: системы поиска музыкальных треков по текстовому описанию настроения, жанра и инструментов.
 
 На текущем этапе реализована инфраструктурная часть проекта:
 
@@ -19,32 +19,46 @@
 - публикация образов в GitHub Container Registry;
 - структурированное JSON-логирование.
 
-## ДЗ3: MLflow
-
-Добавлен полный ML-цикл для классификатора тегов (genre / instrument / mood)
-поверх эмбеддингов EffNet-Discogs:
-
-- MLflow Tracking Server в Docker Compose: Backend Store в PostgreSQL
-  (`mlflow-db`), Artifact Store в MinIO (S3);
-- EDA, Dataset Tracking, эксперименты и Model Registry (`training/`);
-- модель загружается из Registry по alias `champion` при старте приложения;
-- `POST /api/v1/process` и `GET /api/v1/model`.
-
-Быстрый старт:
+## Быстрый старт
 
 ```bash
 cp .env.example .env
-uv lock && uv sync --group training
 docker compose up --build -d
-uv run --env-file .env --group training python training/upload_dataset.py \
-    --file training/data/out/embeddings.parquet \
-    --manifest training/data/out/manifest.json
-uv run --env-file .env --group training python training/eda.py
-uv run --env-file .env --group training python training/train.py --model all
-uv run --env-file .env --group training python training/registry.py promote
-docker compose restart app
-uv run --env-file .env --group training python training/demo_request.py
+docker compose ps
 ```
+
+После запуска:
+
+- API и Swagger: http://localhost:8000/docs
+- MLflow UI: http://localhost:5000
+
+Сервис берёт модель из MLflow Model Registry. Если модель ещё не обучена (новое окружение, пустой Registry), приложение запустится, но `/api/v1/process` и `/api/v1/health` будут отвечать `503`. Как обучить и зарегистрировать модель: [Полный цикл обучения](#полный-цикл-обучения).
+
+Проверка, что модель загружена и отвечает:
+
+```bash
+curl -s http://localhost:8000/api/v1/model | python3 -m json.tool
+uv sync --group training
+uv run --env-file .env --group training python training/demo_request.py --n 3
+```
+
+## MLflow
+
+Добавлен полный ML-цикл для классификатора тегов поверх эмбеддингов
+EffNet-Discogs. Модель размечает трек по четырём категориям: `genre`,
+`instrument`, `mood` и `theme` (назначение музыки: кино, реклама, игры и т.д.).
+
+- MLflow Tracking Server в Docker Compose: Backend Store в PostgreSQL
+  (`mlflow-db`), Artifact Store в MinIO (S3);
+- EDA и анализ похожести тегов как артефакты MLflow;
+- Dataset Tracking: версии датасета в MinIO (`v1`, `v2`), source и digest в MLflow;
+- эксперименты: родительский Run и вложенные Runs для каждого семейства моделей;
+- Model Registry: alias `champion` (рабочая версия) и `previous` (для отката);
+- модель загружается из Registry по alias один раз при старте приложения;
+- `POST /api/v1/process` и `GET /api/v1/model`.
+
+Подробности и результаты: раздел [Обучение модели](#обучение-модели) и
+отчёт по текущей версии [reports/model-v6](reports/model-v6/README.md).
 
 ## Структура проекта
 
@@ -82,13 +96,20 @@ music-mood-search/
 │   ├── data/
 │   │   ├── extract_embeddings.py   # эмбеддинги EffNet-Discogs из аудио
 │   │   └── requirements.txt
-│   ├── common.py                   # датасет, Dataset Tracking, метки
+│   ├── common.py                   # датасет, Dataset Tracking, метки, группы тегов
 │   ├── demo_request.py             # демонстрационный запрос к /process
 │   ├── eda.py                      # EDA, артефакты в MLflow
+│   ├── metrics.py                  # PR-AUC, precision@k, hit@k, интервалы
 │   ├── music_tagger_pyfunc.py      # pyfunc-обёртка модели
-│   ├── registry.py                 # версии, alias champion
-│   ├── train.py                    # Runs, метрики, регистрация моделей
+│   ├── registry.py                 # версии, alias champion и previous
+│   ├── tag_groups.json             # группы тегов mood и theme
+│   ├── tag_similarity.py           # анализ похожести тегов для группировки
+│   ├── tagger_heads.py             # классификаторы: logreg, kNN, MLP (PyTorch)
+│   ├── train.py                    # Runs, метрики, сборка и регистрация модели
 │   └── upload_dataset.py           # загрузка датасета в MinIO
+│
+├── reports/
+│   └── model-v6/                   # метрики и графики текущей версии модели
 │
 ├── tests/
 │   ├── __init__.py
@@ -96,7 +117,8 @@ music-mood-search/
 │   ├── fakes.py
 │   ├── test_health.py
 │   ├── test_model_service.py
-│   └── test_process.py
+│   ├── test_process.py
+│   └── test_training.py
 │
 ├── .dockerignore
 ├── .env.example
@@ -121,6 +143,7 @@ music-mood-search/
 - MLflow
 - MinIO
 - scikit-learn
+- PyTorch (CPU)
 - NumPy
 - pandas
 - Essentia
@@ -174,11 +197,19 @@ music-mood-search/
 
 Показывает, какая модель обслуживает запросы: имя, alias, версию, `run_id` в MLflow и URI загруженной версии.
 
+Поле `embedding` описывает, каким должен быть входной эмбеддинг: модель EffNet-Discogs, слой, частота дискретизации, усреднение по времени, размерность. Эмбеддинги, полученные иначе, модель примет, но предсказания будут бессмысленными. У старых версий модели (до v5) поле равно `null`.
+
 Если модель не загружена, возвращает `503 Service Unavailable`.
 
 ### `POST /api/v1/process`
 
-Принимает до 64 эмбеддингов EffNet-Discogs (по 1280 чисел в каждом) и возвращает для каждого трека теги трёх категорий: `genre`, `instrument` и `mood`. У каждого тега есть оценка (`score`).
+Принимает до 64 эмбеддингов EffNet-Discogs (по 1280 чисел в каждом) и возвращает для каждого трека теги четырёх категорий: `genre`, `instrument`, `mood` и `theme`. У каждого тега есть оценка (`score`). В каждой категории возвращаются теги выше порога (не больше трёх), а если порог не прошёл ни один, то самый вероятный.
+
+Для `mood` и `theme` возвращаются группы тегов (например, `calm` или `cinematic`), а не исходные теги датасета. Если у модели нет классификатора категории (старые версии без `theme`), возвращается пустой список.
+
+Запрос отклоняется с кодом `422`, если эмбеддинг неверной длины, пакет больше 64 или среди значений есть `NaN` или бесконечность.
+
+Модель синхронная, поэтому inference выполняется в пуле потоков (`run_in_threadpool`) и не блокирует event loop.
 
 Пример запроса:
 
@@ -191,6 +222,120 @@ music-mood-search/
 - `model` с информацией о версии модели, которая дала предсказание;
 - `predictions` со списками тегов для каждого трека;
 - `inference_ms`, время работы модели.
+
+## Обучение модели
+
+### Полный цикл обучения
+
+Нужны запущенные сервисы (`docker compose up -d`) и эмбеддинги в `training/data/out/` (их создаёт `training/data/extract_embeddings.py` из аудио MTG-Jamendo). Все команды выполняются из корня репозитория.
+
+```bash
+uv sync --group training
+# в .env переменная DATASET_URI указывает, какую версию данных использовать
+
+# 1. Загрузить датасет в MinIO (версия не перезаписывается)
+uv run --env-file .env --group training python training/upload_dataset.py \
+    --file training/data/out/embeddings.parquet \
+    --manifest training/data/out/manifest.json
+
+# 2. EDA и анализ похожести тегов
+uv run --env-file .env --group training python training/eda.py
+uv run --env-file .env --group training python training/tag_similarity.py
+
+# 3. Обучение, выбор версии, перезапуск сервиса
+uv run --env-file .env --group training python training/train.py
+uv run --env-file .env --group training python training/registry.py promote
+docker compose restart app
+
+# 4. Демонстрационный запрос
+uv run --env-file .env --group training python training/demo_request.py --n 3
+```
+
+Для быстрой проверки всей цепочки: `train.py --smoke --no-register` (2 фолда, одна точка сетки, несколько эпох).
+
+### Данные
+
+- **Источник:** MTG-Jamendo, подмножество moodtheme, официальное разбиение `split-0` на train, validation и test. Треки одного артиста не попадают в разные части.
+- **Признаки:** эмбеддинги EffNet-Discogs (1280 чисел), усреднённые по всему треку. Извлекаются скриптом `training/data/extract_embeddings.py`.
+- **Версии:** датасет лежит в MinIO по пути `s3://datasets/mtg-jamendo-moodtheme/vN/embeddings.parquet`. Версия не перезаписывается: новые данные загружаются в новую папку (`v1`: 1889 треков, `v2`: около 5,5 тысячи). Скрипты берут версию из `DATASET_URI` (или `--data`) и без неё не запускаются, чтобы не обучиться случайно на устаревших данных.
+- **Dataset Tracking:** в каждом Run записываются URI, sha256 файла и версия данных. Каждая часть (train, validation, test) логируется как MLflow Dataset со своим digest.
+
+### Категории и группы тегов
+
+`genre` и `instrument` используют теги датасета как есть. Теги настроения и назначения музыки объединены в группы (`training/tag_groups.json`): например, `calm` включает calm, relaxing, meditative, soft и hopeful, а `cinematic` включает film, movie, trailer, drama, action и adventure. Отдельных тегов слишком много, они редкие и по звучанию часто неразличимы (calm и relaxing, sad и melancholic).
+
+Группы подобраны по смыслу и проверены скриптом `training/tag_similarity.py`: он считает косинусную близость средних эмбеддингов тегов и для каждой группы проверяет, что её теги ближе друг к другу, чем к соседней группе. Дополнительно дендрограммы в [reports/model-v6/tag_similarity](reports/model-v6/tag_similarity).
+
+Каждая категория обучается и оценивается только на треках, где она размечена. Классификатор инструментов не видит треки без тегов инструментов: отсутствие тега там означает «не размечено», а не «инструмента нет».
+
+### Модели и подбор
+
+Для каждой категории обучается отдельный классификатор. Сравниваются четыре семейства:
+
+| Семейство | Описание | Сетка гиперпараметров |
+|---|---|---|
+| `logreg` | логистическая регрессия на каждый тег (baseline) | C: 0.01, 0.1, 1 |
+| `knn` | k ближайших соседей, косинусная близость | k: 10, 20, 50 |
+| `mlp_bce` | один скрытый слой, PyTorch, binary cross-entropy | hidden 256/512, dropout 0.2/0.5 |
+| `mlp_asl` | то же с asymmetric loss (для редких тегов) | плюс gamma_neg 2/4 |
+
+Роли выборок:
+
+- **train:** обучение, подбор гиперпараметров и порогов. Кросс-валидация GroupKFold (5 фолдов) по артистам, чтобы песни одного исполнителя не попадали одновременно в обучение и проверку. Порог для каждого тега подбирается по F1 на out-of-fold предсказаниях.
+- **validation:** только выбор семейства внутри категории.
+- **test:** один раз, для итоговой оценки собранной модели.
+
+Выбранные классификаторы собираются в одну pyfunc-модель (`training/music_tagger_pyfunc.py`). Вместе с моделью сохраняются описание эмбеддинга, версия и sha256 данных, sha256 файла групп.
+
+В MLflow один запуск `train.py` выглядит так: родительский Run `tagger-v2-groups` и вложенные Runs `mood/logreg`, `mood/knn` и т.д. В каждом вложенном Run записаны гиперпараметры, CV-метрики и метрики на validation. В родительском Run записаны итоговые метрики на test, диагностика и зарегистрированная модель.
+
+### Метрики
+
+- **PR-AUC (macro)** по тегам: основная метрика. Не зависит от порога и честно работает при редких тегах. У случайной модели PR-AUC равен доле треков с тегом.
+- **precision@10:** доля верных среди 10 треков с наибольшей оценкой тега. Отвечает на вопрос пользователя «найди мне спокойную музыку».
+- **hit@3:** доля треков, у которых среди трёх предложенных тегов есть верный.
+- **F1** по подобранным порогам: качество итоговых тегов в ответе сервиса.
+- **Общая метрика** `val_pr_auc_overall`: среднее PR-AUC по категориям с равными весами (веса задаются `--weights mood=2`). По ней сравниваются версии в Registry.
+- **Доверительный интервал** PR-AUC на test: 200 раз берётся случайная половина треков (без повторений) и считается разброс метрики. Если интервалы двух моделей сильно пересекаются, разница между ними может быть случайной.
+
+### Результаты (версия 6)
+
+| Категория | Модель | val PR-AUC | test PR-AUC [95% ДИ] | test P@10 | test hit@3 |
+|---|---|---|---|---|---|
+| mood | mlp_asl | 0.275 | 0.295 [0.275; 0.316] | 0.464 | 0.70 |
+| theme | mlp_bce | 0.289 | 0.318 [0.283; 0.354] | 0.511 | 0.79 |
+| genre | knn | 0.287 | 0.258 [0.232; 0.284] | 0.377 | 0.81 |
+| instrument | mlp_bce | 0.209 | 0.248 [0.218; 0.277] | 0.495 | 0.79 |
+| **общая** | | 0.265 | 0.280 | 0.462 | |
+
+PR-AUC выше случайного уровня от 3 раз (mood) до 16 раз (genre, где много редких тегов). У 70-80% треков среди трёх предложенных тегов есть верный.
+
+Подробнее: [reports/model-v6](reports/model-v6/README.md) (проверка групп тегов, дендрограммы).
+
+### Выбор версии в Model Registry
+
+```bash
+uv run --env-file .env --group training python training/registry.py list
+uv run --env-file .env --group training python training/registry.py promote
+uv run --env-file .env --group training python training/registry.py set-alias --version 6
+```
+
+`promote` назначает `champion` лучшей версии по `val_pr_auc_overall` и соблюдает два правила:
+
+- сравниваются только версии с одинаковой постановкой: тот же датасет (sha256) и те же группы тегов. Метрики на разных данных или разных наборах меток несравнимы;
+- новая версия не проходит, если хотя бы одна категория хуже текущего `champion` больше чем на `--tolerance`.
+
+При смене `champion` прежняя версия получает alias `previous`, поэтому откат выполняется одной командой.
+
+### Смена модели без изменения кода
+
+Приложение загружает модель `models:/music-tagger@champion` один раз при старте. Чтобы сменить версию, нужно переназначить alias и перезапустить сервис:
+
+```bash
+uv run --env-file .env --group training python training/registry.py set-alias --version 5
+docker compose restart app
+curl -s http://localhost:8000/api/v1/model    # "version": "5"
+```
 
 
 ## Конфигурация
@@ -213,6 +358,14 @@ http://mlflow:5000
 | `MLFLOW_TRACKING_URI` | адрес MLflow Tracking Server | `http://mlflow:5000` внутри Compose |
 | `MODEL_NAME` | имя модели в Model Registry | `music-tagger` |
 | `MODEL_ALIAS` | alias версии, которая обслуживает запросы | `champion` |
+
+Скриптам из `training/` дополнительно нужны:
+
+| Переменная | Назначение |
+|---|---|
+| `DATASET_URI` | версия датасета, например `s3://datasets/mtg-jamendo-moodtheme/v2/embeddings.parquet` (обязательна) |
+| `MLFLOW_S3_ENDPOINT_URL` | адрес MinIO, `http://localhost:9000` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | доступ к MinIO |
 
 
 
@@ -268,7 +421,10 @@ uv run pytest --cov=music_mood_search --cov-report=term-missing
 - ситуации, когда PostgreSQL недоступен или модель не загружена;
 - загрузка модели: alias превращается в конкретную версию, повторные попытки при ошибке;
 - `POST /api/v1/process`: успешный запрос, неверная размерность эмбеддинга, слишком большой пакет, ответ `503` без модели;
-- `GET /api/v1/model`.
+- `GET /api/v1/model`;
+- код обучения (`tests/test_training.py`): метрики, классификаторы и их сохранение, разметка по группам тегов, правила `promote`, доверительные интервалы, версия данных.
+
+MLflow и модель в тестах API подменяются (`tests/fakes.py`), поэтому тесты не требуют запущенного MLflow. Тест MLP пропускается, если PyTorch не установлен.
 
 Минимально допустимое покрытие:
 
@@ -333,6 +489,9 @@ Dockerfile использует:
 - непривилегированного пользователя `appuser`.
 
 Проверить пользователя контейнера:
+```bash
+docker compose exec app whoami
+```
 
 Приложение внутри контейнера запускается не от `root`.
 
@@ -367,9 +526,11 @@ minio        healthy
 ```text
 API:           http://localhost:8000
 MLflow UI:     http://localhost:5000
-MinIO консоль: http://localhost:9001
+MinIO S3 API:  http://localhost:9000
 PostgreSQL:    localhost:55432
 ```
+
+Используемый образ MinIO (`bitnamilegacy/minio`) не содержит веб-консоли, поэтому порт 9001 не отвечает. Содержимое бакетов можно посмотреть через AWS CLI или boto3.
 
 Docker Compose содержит:
 
@@ -498,10 +659,10 @@ sha-1dc2e5d
 
 Назначение тегов:
 
-- `0.1.1` — конкретная версия приложения;
-- `0.1` — последняя patch-версия ветки `0.1`;
-- `latest` — последний опубликованный релиз;
-- `sha-*` — образ, соответствующий конкретному Git-коммиту.
+- `0.1.1`: конкретная версия приложения;
+- `0.1`: последняя patch-версия ветки `0.1`;
+- `latest`: последний опубликованный релиз;
+- `sha-*`: образ, соответствующий конкретному Git-коммиту.
 
 Скачать конкретную версию:
 
@@ -547,24 +708,6 @@ git push origin v0.1.1
 Текущие релизы:
 
 ```text
-v0.1.0 — первая рабочая инфраструктурная версия
-v0.1.1 — добавлено структурированное логирование
+v0.1.0: первая рабочая инфраструктурная версия
+v0.1.1: добавлено структурированное логирование
 ```
-
-## Развитие Music Mood Search
-
-Текущая версия проекта содержит инфраструктурную основу будущего ML-сервиса.
-
-Планируемая функциональность Music Mood Search:
-
-1. Извлечение музыкальных эмбеддингов с помощью Essentia EffNet-Discogs.
-2. Обучение лёгких классификаторов для тегов:
-   - mood;
-   - genre;
-   - instrument.
-3. Использование MTG-Jamendo Dataset для обучения классификатора.
-4. Использование Song Describer Dataset для построения поисковой базы.
-5. Объединение предсказанных музыкальных тегов с текстовыми описаниями треков.
-6. Индексация треков в Chroma.
-7. Поиск треков по текстовому описанию пользователя.
-8. Возможность загрузки собственного трека и добавления его в поисковую коллекцию.

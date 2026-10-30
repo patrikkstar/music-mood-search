@@ -4,7 +4,8 @@ version = "0.2.0"
 description = "Asynchronous MLOps web service"
 readme = "README.md"
 authors = [
-    { name = "Анастасия Короткевич"}
+    { name = "Анастасия Короткевич"},
+    { name = "Арина Мищенко"},
 ]
 requires-python = ">=3.12"
 dependencies = [
@@ -14,6 +15,7 @@ dependencies = [
     "numpy>=1.26",
     "pydantic-settings>=2.15.0",
     "scikit-learn>=1.6",
+    "torch>=2.6",
     "uvicorn[standard]>=0.53.0",
 ]
 
@@ -38,6 +40,19 @@ training = [
     "matplotlib>=3.9",
     "pyarrow>=17",
 ]
+
+# PyTorch ставится только CPU-сборкой: с PyPI по умолчанию приходят
+# CUDA-библиотеки на несколько гигабайт, которые сервису не нужны.
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.ruff]
 target-version = "py312"

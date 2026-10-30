@@ -5,9 +5,10 @@
 указывается как source датасета в MLflow.
 
 Пример:
-    uv run --group training python training/upload_dataset.py \
+    uv run --env-file .env --group training python training/upload_dataset.py \
         --file training/data/out/embeddings.parquet \
-        --manifest training/data/out/manifest.json
+        --manifest training/data/out/manifest.json \
+        --uri s3://datasets/mtg-jamendo-moodtheme/v2/embeddings.parquet
 """
 
 from __future__ import annotations
@@ -17,7 +18,13 @@ import json
 from pathlib import Path
 
 from botocore.exceptions import ClientError
-from common import Config, file_sha256, parse_s3_uri, s3_client
+from common import (
+    Config,
+    file_sha256,
+    parse_s3_uri,
+    require_dataset_uri,
+    s3_client,
+)
 
 
 def ensure_bucket(client, bucket: str) -> None:
@@ -45,6 +52,7 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="перезаписать версию")
     args = parser.parse_args()
 
+    args.uri = require_dataset_uri(args.uri)
     bucket, key = parse_s3_uri(args.uri)
     client = s3_client(cfg)
     ensure_bucket(client, bucket)
