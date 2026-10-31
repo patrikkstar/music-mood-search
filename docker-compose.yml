@@ -19,12 +19,15 @@ services:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MODEL_NAME: music-tagger
       MODEL_ALIAS: champion
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mood}:${RABBITMQ_PASSWORD:-mood_local_only}@rabbitmq:5672/
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
       mlflow:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     networks:
       - app_network
@@ -58,13 +61,74 @@ services:
     networks:
       - app_network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d postgres" ]
       interval: 5s
       timeout: 5s
       retries: 5
     restart: unless-stopped
     mem_limit: 512m
     cpus: 1.0
+    logging: *default-logging
+
+
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - uv
+      - run
+      - --no-sync
+      - python
+      - -m
+      - music_mood_search.messaging.worker
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/postgres
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: music-tagger
+      MODEL_ALIAS: champion
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mood}:${RABBITMQ_PASSWORD:-mood_local_only}@rabbitmq:5672/
+      RABBITMQ_QUEUE_LIMIT: "20"
+      INFERENCE_DELAY_S: "1.0"
+    depends_on:
+      db:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - app_network
+    restart: unless-stopped
+    stop_grace_period: 90s
+    mem_limit: 2g
+    cpus: 1.0
+    logging: *default-logging
+
+
+
+    # ---------------------------------------------------------------- RabbitMQ
+  rabbitmq:
+    image: rabbitmq:4.1.8-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-mood}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-mood_local_only}
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - app_network
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    mem_limit: 512m
     logging: *default-logging
 
   # ---------------------------------------------------------------- MLflow
@@ -83,7 +147,7 @@ services:
     networks:
       - app_network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+      test: [ "CMD-SHELL", "pg_isready -U mlflow -d mlflow" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -108,7 +172,7 @@ services:
     networks:
       - app_network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -186,6 +250,7 @@ volumes:
   postgres_data:
   mlflow_db_data:
   minio_data:
+  rabbitmq_data:
 
 networks:
   app_network:

@@ -5,9 +5,12 @@ from time import perf_counter
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
+from faststream.rabbit import RabbitBroker
+from faststream.rabbit.schemas import Channel
 
 from music_mood_search.api.health import router as health_router
 from music_mood_search.api.process import router as process_router
+from music_mood_search.api.tasks import router as tasks_router
 from music_mood_search.config import get_settings
 from music_mood_search.db import close_db_pool, create_db_pool
 from music_mood_search.logging_config import configure_logging
@@ -41,7 +44,16 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.model_service = model_service
 
     try:
-        yield
+        async with RabbitBroker(
+            settings.rabbitmq_url,
+            default_channel=Channel(
+                publisher_confirms=True,
+                on_return_raises=True,
+            ),
+        ) as broker:
+            application.state.rabbit_broker = broker
+            logger.info("RabbitMQ publisher connected")
+            yield
     finally:
         await close_db_pool(application.state.db_pool)
 
@@ -86,6 +98,7 @@ def create_app() -> FastAPI:
 
     application.include_router(health_router)
     application.include_router(process_router)
+    application.include_router(tasks_router)
 
     return application
 
