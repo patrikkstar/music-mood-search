@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     embedding_dim: int = 1280
     max_batch_size: int = 64
 
+    # RabbitMQ (значения по умолчанию для локальной разработки).
+    rabbitmq_url: str = "amqp://mood:mood_local_only@127.0.0.1:5672/"
+    rabbitmq_queue_limit: int = 20
+    inference_delay_s: float = 1.0
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
