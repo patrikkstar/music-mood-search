@@ -886,3 +886,162 @@ inference, но не включает сетевое время до созда�
 Прямые публикации через batch_source.py в расчёт не включены.
 Данное измерение не заменяет отдельные оценки latency
 для экспериментов A, B и C.
+
+
+<!-- HW5_OBSERVABILITY_SECTION -->
+## ДЗ №5. Наблюдаемость конвейера
+
+В проект добавлена наблюдаемость для асинхронного конвейера `FastAPI → RabbitMQ → Worker → MLflow → PostgreSQL`:
+
+- **Логи:** структурированные JSON-записи с `service`, `event`, `task_id`, `trace_id` и `span_id`; сбор через Grafana Alloy в Loki.
+- **Трейсы:** OpenTelemetry → OTel Collector → Tempo; контекст передаётся между API, RabbitMQ и воркером. В Tempo доступны спаны публикации, обработки, `inference`, записи в БД.
+- **Метрики:** Prometheus собирает метрики OTel Collector и RabbitMQ; учитываются HTTP-запросы, длительность inference, публикации и обработки, число обработанных задач, состояние очереди, память (RSS), отказы брокера и ожидание источника.
+- **Визуализация:** Grafana с автоматически подготовленными источниками данных, дашбордом «Конвейер — MLOps HW5» и двумя правилами алертов.
+
+### Запуск
+
+Из корня проекта (предварительно создать `.env` из `.env.example` и подготовить зарегистрированную в MLflow модель `music-tagger@champion`):
+
+```powershell
+docker compose config --quiet
+docker compose up -d --build
+```
+
+Полный стек наблюдаемости:
+
+```powershell
+docker compose --profile observability up -d --build
+docker compose --profile observability ps -a
+```
+
+Проверка состава сервисов в двух вариантах:
+
+```powershell
+docker compose config --services
+docker compose --profile observability config --services
+```
+
+Отдельные профили: `logs` (Loki, Alloy), `traces` (Tempo, OTel Collector), `metrics` (Prometheus, OTel Collector), `observability` (всё перечисленное плюс Grafana). Для выполнения пакетного источника также предусмотрен профиль `load`.
+
+Интерфейсы локального стенда:
+
+| Сервис | URL |
+|---|---|
+| API и Swagger | http://localhost:8000/docs |
+| Grafana | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
+| Loki | http://localhost:3100/ready |
+| Tempo | http://localhost:3200/ready |
+| Alloy | http://localhost:12345 |
+| RabbitMQ Management | http://localhost:15672 |
+
+Учётные данные Grafana задаются `GRAFANA_ADMIN_PASSWORD` в локальном `.env`; не публикуйте пароли и реальные секреты в Git. Доступ к сервисам наблюдаемости ограничен `127.0.0.1`.
+
+### Как проверить данные
+
+**Loki:** Grafana → Explore → Loki; поиск API-логов:
+
+```logql
+{service="music-api"}
+```
+
+Поиск логов конкретной задачи в двух сервисах:
+
+```logql
+{service=~"music-api|music-worker"} |= "TASK_ID"
+```
+
+**Tempo:** Grafana → Explore → Tempo → Trace ID. Получите `trace_id` из логов API; в одном трейсе должны быть `POST /api/v1/tasks`, `rabbitmq.publish`, обработка воркером, `inference` и `db.write_result`.
+
+**Prometheus:** Grafana → Explore → Prometheus. Примеры запросов:
+
+```promql
+up
+```
+
+```promql
+rabbitmq_detailed_queue_messages_ready{queue="music.tasks"}
+```
+
+```promql
+sum by (exported_instance) (rate(music_tasks_processed_total[1m]))
+```
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(music_inference_duration_seconds_bucket[5m])))
+```
+
+Некоторые счётчики не создают ряд до первого события. Пустая панель ошибок или 503 при отсутствии таких событий не является доказательством неисправности.
+
+### Проверка обработки задачи
+
+Создать задачу с эмбеддингом размерности 1280:
+
+```powershell
+@'
+import json
+import urllib.request
+
+payload = json.dumps({"embeddings": [[0.01] * 1280]}).encode()
+request = urllib.request.Request(
+    "http://localhost:8000/api/v1/tasks",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=15) as response:
+    print(response.status, response.read().decode())
+'@ | python
+```
+
+Ожидаемый код: `202 Accepted`. В логах API и воркера можно найти одинаковый `task_id` и `trace_id`. У отдельных спанов будут разные `span_id`.
+
+### Пакетный источник и масштабирование
+
+Проверенный запуск короткой нагрузки на 40 задач с локальным демо-датасетом:
+
+```powershell
+$trainingDir = (Resolve-Path .\training).Path
+docker compose --profile observability run --rm --no-deps `
+  -v "${trainingDir}:/app/training:ro" `
+  -e OTEL_SERVICE_NAME=music-source `
+  worker uv run --no-sync python -m music_mood_search.messaging.batch_source `
+  --data training/data/out/demo_embeddings.parquet `
+  --limit 40
+```
+
+Для сравнения одного и двух воркеров:
+
+```powershell
+docker compose --profile observability up -d --no-deps --scale worker=2 worker
+docker compose exec -T rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+# повторить запуск источника с теми же параметрами
+docker compose --profile observability up -d --no-deps --scale worker=1 worker
+```
+
+Промежуточный результат испытания с одним воркером и `--limit 40`: опубликовано 40 задач за 20,03 с, зафиксировано 48 отклонённых *попыток* публикации и 14,05 с суммарного ожидания источника. Отклонённые попытки повторяются с backoff и не равны числу потерянных задач. Для двух воркеров подтверждена обработка задач обоими экземплярами, но точное ускорение следует рассчитывать отдельно по сопоставимым интервалам.
+
+### Алерты и отказоустойчивость
+
+Автоматически provisioned правила Grafana:
+
+1. **«Очередь заполнена более 90%»** — наблюдается при высокой загрузке `music.tasks`. При тестовой остановке воркера и заполнении очереди подтверждён переход в `Pending`; переход в `Firing` требуется отдельно зафиксировать.
+2. **«Сообщения в DLQ»** — реагирует на сообщения в `music.tasks.dlq`. Проверен переход `Normal → Pending → Firing` при отклонении одного тестового сообщения с `requeue=False`.
+
+Проверка штатного завершения воркера при `docker compose stop worker`: в логах видны `shutdown_started`, `shutdown_completed` и `FastStream app shut down gracefully`. После запуска воркер снова подключается к RabbitMQ.
+
+Нельзя использовать `docker compose down -v` для обычной остановки стенда: это удаляет тома PostgreSQL, MinIO, MLflow и хранилищ наблюдаемости. Для обычной остановки используйте `docker compose stop` либо `docker compose --profile observability stop`.
+
+### Тесты
+
+В WSL из корня проекта:
+
+```bash
+export UV_PROJECT_ENVIRONMENT=.venv-wsl
+export UV_LINK_MODE=copy
+uv run --no-sync python -m pytest -q
+```
+
+После изменений ДЗ №5 выполнен полный прогон: **64 passed, 1 warning** (предупреждение MLflow о типизации `predict`).
+
+Файлы наблюдаемости находятся в `observability/`, Python-инструментация — `src/music_mood_search/telemetry.py`; конфигурация Compose-профилей — `docker-compose.override.yml`.

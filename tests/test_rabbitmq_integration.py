@@ -1,3 +1,5 @@
+import asyncio
+
 import aio_pika
 import pytest
 from aio_pika.exceptions import DeliveryError
@@ -16,6 +18,24 @@ def rabbitmq_url():
         host = container.get_container_host_ip()
         port = container.get_exposed_port(5672)
         yield f"amqp://test:test@{host}:{port}/"
+
+
+async def wait_for_message(queue, timeout=5.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    while loop.time() < deadline:
+        message = await queue.get(
+            fail=False,
+            timeout=5.0,
+        )
+
+        if message is not None:
+            return message
+
+        await asyncio.sleep(0.1)
+
+    pytest.fail(f"Message did not arrive in {queue.name}")
 
 
 @pytest.mark.asyncio
@@ -79,7 +99,7 @@ async def test_queue_limit_and_dead_letter(rabbitmq_url):
         assert first.body == b"task-1"
         await first.reject(requeue=False)
 
-        dead = await dlq.get(timeout=5.0)
+        dead = await wait_for_message(dlq)
         assert dead.body == b"task-1"
         await dead.ack()
 
