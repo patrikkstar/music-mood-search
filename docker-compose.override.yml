@@ -1,0 +1,134 @@
+# Automatic overlay for docker-compose.yml. Existing services/data are preserved.
+services:
+  app:
+    environment:
+      OTEL_SERVICE_NAME: music-api
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_RESOURCE_ATTRIBUTES: service.version=0.2.0,deployment.environment.name=development,service.instance.id=api-1
+      OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+  worker:
+    environment:
+      OTEL_SERVICE_NAME: music-worker
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_RESOURCE_ATTRIBUTES: service.version=0.2.0,deployment.environment.name=development
+      OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+  source:
+    profiles: [load]
+    build:
+      context: .
+      dockerfile: docker/source/Dockerfile
+    command: ["uv", "run", "--no-sync", "python", "-m", "music_mood_search.messaging.batch_source", "--data", "/data/demo_embeddings.parquet", "--limit", "${SOURCE_LIMIT:-360}"]
+    volumes:
+      - ./training/data/out:/data:ro
+    environment:
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+      EMBEDDING_DIM: "1280"
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-mood}:${RABBITMQ_PASSWORD:-mood_local_only}@rabbitmq:5672/
+      OTEL_SERVICE_NAME: music-source
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_RESOURCE_ATTRIBUTES: service.version=0.2.0,deployment.environment.name=development
+      OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks: [app_network]
+    mem_limit: 512m
+    restart: "no"
+  rabbitmq:
+    ports:
+      - "127.0.0.1:15692:15692"
+    volumes:
+      - ./observability/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+  loki:
+    image: grafana/loki:3.7.0
+    profiles: [logs, observability]
+    user: "0:0" # local demo: volume permissions
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    ports: ["127.0.0.1:3100:3100"]
+    volumes:
+      - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki_data:/loki
+    networks: [app_network]
+    mem_limit: 320m
+    restart: unless-stopped
+  alloy:
+    image: grafana/alloy:v1.21.0
+    profiles: [logs, observability]
+    user: "0:0" # requires access to Docker socket
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    ports: ["127.0.0.1:12345:12345"]
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    networks: [app_network]
+    mem_limit: 192m
+    restart: unless-stopped
+  tempo:
+    image: grafana/tempo:2.9.0
+    profiles: [traces, observability]
+    user: "0:0"
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    ports: ["127.0.0.1:3200:3200"]
+    networks: [app_network]
+    mem_limit: 256m
+    restart: unless-stopped
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.165.0
+    profiles: [traces, metrics, observability]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel/collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:8889:8889"
+    networks: [app_network]
+    mem_limit: 160m
+    restart: unless-stopped
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    profiles: [metrics, observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus_data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+    networks: [app_network]
+    mem_limit: 256m
+    restart: unless-stopped
+  grafana:
+    image: grafana/grafana:12.2.0
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin_local_only}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:3000:3000"]
+    networks: [app_network]
+    mem_limit: 256m
+    restart: unless-stopped
+volumes:
+  loki_data:
+  alloy_data:
+  tempo_data:
+  prometheus_data:
+  grafana_data:

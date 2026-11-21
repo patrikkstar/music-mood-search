@@ -11,11 +11,10 @@ services:
       dockerfile: Dockerfile
     environment:
       APP_NAME: MLOps Service
-      ENVIRONMENT: production
+      ENVIRONMENT: development
       LOG_LEVEL: INFO
+      OTEL_SERVICE_NAME: music-api
       DATABASE_URL: postgresql://postgres:postgres@db:5432/postgres
-      # Модель берётся из Model Registry по alias. Чтобы сменить версию,
-      # переназначьте alias и перезапустите app (код не меняется).
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MODEL_NAME: music-tagger
       MODEL_ALIAS: champion
@@ -84,6 +83,9 @@ services:
       - -m
       - music_mood_search.messaging.worker
     environment:
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+      OTEL_SERVICE_NAME: music-worker
       DATABASE_URL: postgresql://postgres:postgres@db:5432/postgres
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MODEL_NAME: music-tagger

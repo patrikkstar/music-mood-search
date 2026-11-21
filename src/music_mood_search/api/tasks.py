@@ -6,10 +6,13 @@ from uuid import UUID, uuid4
 from aio_pika.exceptions import AMQPException, DeliveryError
 from fastapi import APIRouter, HTTPException, Request, status
 from faststream.rabbit import RabbitBroker
+from opentelemetry import trace
 from pydantic import BaseModel
 
 from music_mood_search.config import get_settings
+from music_mood_search.logging_config import task_context
 from music_mood_search.schemas import ProcessRequest
+from music_mood_search.telemetry import instruments
 
 router = APIRouter(prefix="/api/v1", tags=["tasks"])
 logger = logging.getLogger(__name__)
@@ -56,57 +59,88 @@ async def create_task(
     broker: RabbitBroker | None = getattr(request.app.state, "rabbit_broker", None)
     pool = getattr(request.app.state, "db_pool", None)
 
-    if broker is None or pool is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable",
-            headers={"Retry-After": retry_after},
-        )
-
     task_id = uuid4()
 
-    try:
-        async with pool.acquire() as connection:
-            async with connection.transaction():
-                await connection.execute(
-                    """
-                    INSERT INTO inference_tasks (id, status)
-                    VALUES ($1, 'PENDING')
-                    """,
-                    task_id,
-                )
+    with task_context(str(task_id)):
+        if broker is None or pool is None:
+            logger.error(
+                "API dependencies unavailable",
+                extra={
+                    "event": "service_unavailable",
+                    "status_code": 503,
+                },
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable",
+                headers={"Retry-After": retry_after},
+            )
 
-                confirmation = await broker.publish(
-                    {
-                        "task_id": str(task_id),
-                        "embeddings": payload.embeddings,
-                    },
-                    queue="music.tasks",
-                    persist=True,
-                    mandatory=True,
-                    message_id=str(task_id),
-                    timeout=1.0,
-                )
+        try:
+            async with pool.acquire() as connection:
+                async with connection.transaction():
+                    with trace.get_tracer(__name__).start_as_current_span(
+                        "db.enqueue_task"
+                    ):
+                        await connection.execute(
+                            """
+                            INSERT INTO inference_tasks (id, status)
+                            VALUES ($1, 'PENDING')
+                            """,
+                            task_id,
+                        )
 
-                if confirmation is False:
-                    raise PublishRejected("RabbitMQ rejected publication")
+                    with trace.get_tracer(__name__).start_as_current_span(
+                        "rabbitmq.publish"
+                    ):
+                        confirmation = await broker.publish(
+                            {
+                                "task_id": str(task_id),
+                                "embeddings": payload.embeddings,
+                            },
+                            queue="music.tasks",
+                            persist=True,
+                            mandatory=True,
+                            message_id=str(task_id),
+                            correlation_id=str(task_id),
+                            timeout=1.0,
+                        )
 
-    except (
-        TimeoutError,
-        DeliveryError,
-        PublishRejected,
-        AMQPException,
-        ConnectionError,
-        OSError,
-    ):
-        logger.warning(
-            "Task publication rejected or unavailable",
-            extra={"task_id": str(task_id)},
+                    if confirmation is False:
+                        raise PublishRejected("RabbitMQ rejected publication")
+
+        except (
+            TimeoutError,
+            DeliveryError,
+            PublishRejected,
+            AMQPException,
+            ConnectionError,
+            OSError,
+        ) as exc:
+            instruments()["rejected"].add(1, {"origin": "api"})
+            logger.warning(
+                "Task publication failed: %s",
+                type(exc).__name__,
+                extra={
+                    "event": "publish_rejected",
+                    "status_code": 503,
+                    "error": type(exc).__name__,
+                },
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Queue overloaded or temporarily unavailable",
+                headers={"Retry-After": retry_after},
+            ) from None
+
+        instruments()["published"].add(1, {"origin": "api"})
+        logger.info(
+            "Task accepted",
+            extra={
+                "event": "task_accepted",
+                "status_code": 202,
+                "batch_size": len(payload.embeddings),
+            },
         )
-        raise HTTPException(
-            status_code=503,
-            detail="Queue overloaded or temporarily unavailable",
-            headers={"Retry-After": retry_after},
-        ) from None
 
-    return TaskAcceptedResponse(task_id=task_id)
+        return TaskAcceptedResponse(task_id=task_id)

@@ -1,0 +1,59 @@
+discovery.docker "music" {
+  host = "unix:///var/run/docker.sock"
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=music-mood-search"]
+  }
+}
+
+discovery.relabel "music" {
+  targets = discovery.docker.music.targets
+
+  // Собираем логи только приложения,
+  // воркеров и источника.
+  rule {
+    source_labels = [
+      "__meta_docker_container_label_com_docker_compose_service",
+    ]
+    action = "keep"
+    regex  = "app|worker|source"
+  }
+
+  rule {
+    source_labels = [
+      "__meta_docker_container_label_com_docker_compose_service",
+    ]
+    target_label = "service"
+  }
+}
+
+loki.source.docker "music" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.music.output
+  labels     = {}
+  forward_to = [loki.process.music.receiver]
+}
+
+loki.process "music" {
+  stage.json {
+    expressions = {
+      service = "service",
+      level   = "level",
+      env     = "env",
+    }
+  }
+  stage.labels {
+    values = {
+      service = "service",
+      level   = "level",
+      env     = "env",
+    }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
